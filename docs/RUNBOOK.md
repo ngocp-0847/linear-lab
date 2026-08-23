@@ -31,7 +31,7 @@ lại kiểu đặt khoá này cho thứ gì chạm mạng thật.
 
 ---
 
-## Bảy thứ phải biết, không có trong tài liệu
+## Tám thứ phải biết, không có trong tài liệu
 
 Tất cả đều tìm ra bằng cách chạy thật rồi đọc log, không suy ra được từ docs.
 
@@ -117,6 +117,51 @@ node -e "require('better-sqlite3')"
 
 Đừng tin `exit 0` của npm khi có native module — kiểm tra `node_modules/.bin/`
 tồn tại và nạp thử module.
+
+### 8. Gán một knowledge cho agent cần BỐN lần đăng ký
+
+Đây là chuỗi dài nhất và không chỗ nào nói liền mạch. Nội dung nằm ở Knowledge
+service, nhưng để agent thấy được thì phải có mặt ở ba bảng khác nhau của Core:
+
+| # | Gọi | Ghi vào | Thiếu thì |
+| --- | --- | --- | --- |
+| 1 | `:8421 wiki/create` + `raw/write` + `ingest` | Knowledge service | không có nội dung |
+| 2 | `:8420 /v3/knowledge/create` | `entity_knowledge` | proxy không tra được chi tiết |
+| 3 | `:8420 /v3/meta/asset/create` | `meta_assets` | bind trả `asset_not_found` |
+| 4 | `:8420 /v3/meta/agent-fixed-asset/set` | `meta_agent_fixed_assets` | agent không nhận |
+
+Ba điểm dễ vấp:
+
+- **Bước 3 dễ bị bỏ sót nhất.** Bước 2 thành công không có nghĩa bind sẽ chạy —
+  hai bảng khác nhau. `asset/create` cho phép chỉ định `asset_id`, nên dùng
+  luôn `wiki_id` để ba bảng cùng khoá.
+- **`/v3/knowledge/*` đòi `Authorization: Bearer` riêng**, khác `/v3/meta/*`
+  (chỉ cần `x-tdai-user-key`). Gateway tắt API key thì giá trị nào cũng qua,
+  nhưng thiếu hẳn header là 401.
+- **Bước 4 dùng `set`, nó THAY THẾ toàn bộ binding.** Mỗi agent được cấp sẵn
+  một `chat_memory` lúc tạo — ghi đè mà không đọc lại và giữ là agent mất luôn
+  bộ nhớ hội thoại của chính nó.
+
+Toàn bộ chuỗi nằm trong [tools/seed-knowledge.mjs](../tools/seed-knowledge.mjs),
+chạy lại được nhiều lần (bỏ qua ingest nếu wiki đã `ready`).
+
+### Giới hạn đã gặp: CodeGraph cần mạng ổn định
+
+`git-fetcher.ts` chỉ nhận **public HTTPS** — `file://`, đường dẫn tuyệt đối và
+địa chỉ nội bộ đều bị chặn cứng, `LocalSourceFetcher` mới là TODO. Nghĩa là repo
+bắt buộc phải công khai.
+
+Trên máy này CodeGraph kẹt ở `step: "cloning"` vì mạng từ WSL ra ngoài chập chờn:
+cùng lúc `github.com` mất 15s mới trả 200 còn `registry.npmjs.org` timeout hẳn,
+dù cả hai vừa hoạt động vài phút trước. Không phải lỗi sản phẩm.
+
+Chẩn đoán nhanh:
+
+```bash
+wsl -- bash -lc 'timeout 40 git ls-remote https://github.com/<owner>/<repo> HEAD'
+```
+
+Treo hoặc `exit=124` thì đừng chờ CodeGraph, sửa mạng trước.
 
 ---
 

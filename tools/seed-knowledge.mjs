@@ -51,6 +51,10 @@ const KNOWLEDGE = process.env.KNOWLEDGE_URL ?? `http://${IP}:8421/v3`;
 const CORE = process.env.CORE_URL ?? `http://${IP}:8420`;
 const SERVICE_ID = process.env.SERVICE_ID ?? "default";
 const USER_KEY = need("LAB_USER_KEY");
+// /v3/knowledge/* đòi Bearer riêng, KHÔNG dùng chung cơ chế với /v3/meta/*
+// (vốn chỉ cần x-tdai-user-key). Gateway đang tắt TDAI_GATEWAY_API_KEY nên giá
+// trị nào cũng qua, nhưng thiếu hẳn header thì 401.
+const GATEWAY_KEY = process.env.GATEWAY_API_KEY ?? ids.gateway_api_key ?? "local";
 const OWNER = need("LAB_OWNER_ID");
 
 const TEAM = need("team_id");
@@ -95,6 +99,14 @@ const created = await post(KNOWLEDGE, "/wiki/create", {
 const wikiId = created.wiki_id ?? created.id;
 info(`wiki_id = ${wikiId}`);
 
+// wiki/create idempotent theo (service, team, name) nên chạy lại không sinh
+// bản trùng. Nhưng ingest thì tốn LLM thật — đã ready rồi thì bỏ qua.
+const already = await post(KNOWLEDGE, "/wiki/get", { team_id: TEAM, wiki_id: wikiId }).catch(() => null);
+const skipIngest = already?.status === "ready" && !process.env.FORCE_INGEST;
+if (skipIngest) {
+  info(`đã ready sẵn (${already.page_count} page) — bỏ qua bước 2–4, đặt FORCE_INGEST=1 để nạp lại`);
+}
+
 step(2, "Tải docs/spec/ lên");
 const specDir = path.join(repo, "docs", "spec");
 const names = (await readdir(specDir)).filter((f) => f.endsWith(".md")).sort();
@@ -105,20 +117,28 @@ const files = await Promise.all(
   })),
 );
 const totalKb = Math.round(files.reduce((n, f) => n + Buffer.byteLength(f.content), 0) / 1024);
-await post(KNOWLEDGE, "/wiki/raw/write", { team_id: TEAM, wiki_id: wikiId, user_id: OWNER, files });
-info(`${files.length} file, ${totalKb} KB: ${names.join(", ")}`);
+if (!skipIngest) {
+  await post(KNOWLEDGE, "/wiki/raw/write", { team_id: TEAM, wiki_id: wikiId, user_id: OWNER, files });
+  info(`${files.length} file, ${totalKb} KB: ${names.join(", ")}`);
+} else {
+  info("bỏ qua");
+}
 
 // ── 3–4. Chưng cất và chờ ───────────────────────────────────────────────────
 
 step(3, "Chạy ingest (LLM chưng cất thành page)");
-await post(KNOWLEDGE, "/wiki/ingest", { team_id: TEAM, wiki_id: wikiId, user_id: OWNER });
-info("đã gửi, đang chạy nền…");
+if (!skipIngest) {
+  await post(KNOWLEDGE, "/wiki/ingest", { team_id: TEAM, wiki_id: wikiId, user_id: OWNER });
+  info("đã gửi, đang chạy nền…");
+} else {
+  info("bỏ qua");
+}
 
 step(4, "Chờ tới khi ready");
 const deadline = Date.now() + 10 * 60_000;
-let detail;
+let detail = already;
 let lastStatus = "";
-while (Date.now() < deadline) {
+while (!skipIngest && Date.now() < deadline) {
   detail = await post(KNOWLEDGE, "/wiki/get", { team_id: TEAM, wiki_id: wikiId });
   const s = detail.status ?? "unknown";
   if (s !== lastStatus) {
@@ -158,7 +178,8 @@ if (!REPO_URL) {
     .then(() => info("đã gửi sync"))
     .catch((e) => info(`sync có thể đã tự chạy lúc create: ${e.message}`));
 
-  const cgDeadline = Date.now() + 10 * 60_000;
+  const waitMin = Number(process.env.CG_WAIT_MIN ?? 4);
+  const cgDeadline = Date.now() + waitMin * 60_000;
   let cgStatus = "";
   while (Date.now() < cgDeadline) {
     const d = await post(KNOWLEDGE, "/code-graph/get", { team_id: TEAM, code_graph_id: cgId });
@@ -176,7 +197,7 @@ if (!REPO_URL) {
     await new Promise((r) => setTimeout(r, 5000));
   }
   if (cgId && cgStatus !== "ready") {
-    info("hết giờ chờ index — bỏ code-graph khỏi phần gán");
+    info(`hết ${waitMin} phút chờ index — bỏ code-graph khỏi phần gán, chạy lại sau bằng CG_WAIT_MIN cao hơn`);
     cgId = null;
   }
 }
@@ -196,7 +217,7 @@ await post(
     team_id: TEAM,
     user_id: OWNER,
   },
-  { "x-tdai-user-key": USER_KEY },
+  { "x-tdai-user-key": USER_KEY, Authorization: `Bearer ${GATEWAY_KEY}` },
 );
 info("wiki đã đăng ký — giờ proxy mới nhìn thấy được");
 
@@ -215,10 +236,49 @@ if (cgId) {
       repo_url: REPO_URL,
       branch: process.env.REPO_BRANCH ?? "main",
     },
-    { "x-tdai-user-key": USER_KEY },
+    { "x-tdai-user-key": USER_KEY, Authorization: `Bearer ${GATEWAY_KEY}` },
   );
   info("code-graph đã đăng ký");
 }
+
+// ── 6b. Tạo bản ghi asset trong meta_assets ─────────────────────────────────
+// Mắt xích thứ ba, và là chỗ dễ hụt nhất: `agent-fixed-asset/set` kiểm
+// `asset_id` trong bảng `meta_assets`, KHÔNG phải `entity_knowledge` vừa ghi ở
+// bước 6. Thiếu bước này thì bind trả `asset_not_found` dù knowledge đã tồn tại.
+//
+// `asset/create` cho phép chỉ định `asset_id`, nên dùng luôn wiki_id /
+// code_graph_id để ba bảng cùng một khoá — tra cứu về sau đỡ phải map.
+
+async function ensureAsset(assetId, assetType, name, description) {
+  try {
+    await post(
+      CORE,
+      "/v3/meta/asset/create",
+      {
+        asset_id: assetId,
+        team_id: TEAM,
+        asset_type: assetType,
+        name,
+        description,
+        owner_user_id: OWNER,
+        source_type: "knowledge_service",
+        source_ref: KNOWLEDGE,
+        visibility: "team",
+        status: "approved",
+      },
+      { "x-tdai-user-key": USER_KEY, Authorization: `Bearer ${GATEWAY_KEY}` },
+    );
+    info(`asset ${assetType} ${assetId} đã tạo`);
+  } catch (e) {
+    // Chạy lại lần hai thì asset đã có — không phải lỗi.
+    if (/exist|duplicate|已存在/i.test(e.message)) info(`asset ${assetId} đã có sẵn`);
+    else throw e;
+  }
+}
+
+step("6b", "Tạo bản ghi asset để bind được");
+await ensureAsset(wikiId, "llm_wiki", "Linear Lab — đặc tả sản phẩm", "Spec: mô hình dữ liệu, máy trạng thái, API, UI, quy ước");
+if (cgId) await ensureAsset(cgId, "code_graph", "linear-lab — đồ thị mã nguồn", "Ký hiệu, file, quan hệ gọi của repo linear-lab");
 
 // ── 7. Gán asset theo vai trò ───────────────────────────────────────────────
 // Mỗi vai trò một loadout riêng — đây chính là điểm của Memory Hub: không phải
@@ -244,15 +304,37 @@ for (const [name, agentId] of Object.entries(AGENTS)) {
     info(`bỏ qua ${name}: thiếu agent_id`);
     continue;
   }
-  const bindings = (LOADOUT[name] ?? []).filter(Boolean);
-  // `set` THAY THẾ toàn bộ binding của agent, không phải thêm vào.
+
+  // `set` THAY THẾ toàn bộ binding, nên phải đọc cái đang có rồi ghép lại.
+  // Mỗi agent được cấp sẵn một chat_memory lúc tạo — ghi đè mà không giữ lại
+  // là agent mất luôn bộ nhớ hội thoại của chính nó.
+  const existing = await post(
+    CORE,
+    "/v3/meta/agent-fixed-asset/list",
+    { agent_id: agentId, limit: 100 },
+    { "x-tdai-user-key": USER_KEY },
+  ).then((r) => r.items ?? []).catch(() => []);
+
+  const keep = existing
+    .filter((b) => b.asset_type !== "llm_wiki" && b.asset_type !== "code_graph")
+    .map((b) => ({
+      asset_id: b.asset_id,
+      asset_type: b.asset_type,
+      injection_mode: b.injection_mode ?? "direct",
+      priority: b.priority ?? 0,
+      created_by: b.created_by ?? OWNER,
+    }));
+
+  const bindings = [...keep, ...(LOADOUT[name] ?? []).filter(Boolean)];
   await post(
     CORE,
     "/v3/meta/agent-fixed-asset/set",
     { agent_id: agentId, bindings },
     { "x-tdai-user-key": USER_KEY },
   );
-  info(`${name} ← ${bindings.map((b) => b.asset_type).join(" + ") || "(rỗng)"}`);
+  const kept = keep.map((b) => b.asset_type).join("+") || "—";
+  const added = (LOADOUT[name] ?? []).filter(Boolean).map((b) => b.asset_type).join("+") || "—";
+  info(`${name}: giữ [${kept}] + thêm [${added}]`);
 }
 
 console.log(`\nXong. wiki=${wikiId}  code_graph=${cgId ?? "(bỏ qua)"}`);

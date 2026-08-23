@@ -38,6 +38,10 @@ const OPENAI_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 const DEFAULT_MODEL = process.env.SHIM_MODEL || "gpt-5.5";
 const DEBUG = process.env.SHIM_DEBUG === "1";
+// Không có timeout thì một upstream treo sẽ giữ kết nối vô hạn: client chờ mãi,
+// log không có dòng kết thúc, và không cách nào biết là treo hay đang nghĩ lâu.
+// Model suy luận + prompt lớn có thể mất vài phút, nên để rộng nhưng hữu hạn.
+const UPSTREAM_TIMEOUT_MS = Number(process.env.SHIM_TIMEOUT_MS ?? 300_000);
 
 if (!OPENAI_KEY) {
   console.error("[shim] thiếu OPENAI_API_KEY");
@@ -383,7 +387,8 @@ const server = createServer(async (req, res) => {
   }
 
   const body = toOpenAiBody(a);
-  dbg(`→ ${body.model} msgs=${body.messages.length} tools=${body.tools?.length ?? 0} stream=${body.stream}`);
+  const promptChars = body.messages.reduce((n, m) => n + (typeof m.content === "string" ? m.content.length : 0), 0);
+  dbg(`→ ${body.model} msgs=${body.messages.length} prompt=${promptChars}ch tools=${body.tools?.length ?? 0} stream=${body.stream}`);
 
   let upstream;
   try {
@@ -391,10 +396,17 @@ const server = createServer(async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_KEY}` },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
   } catch (e) {
-    log("upstream lỗi mạng:", String(e));
-    return anthropicError(res, 502, "api_error", `không gọi được upstream: ${String(e)}`);
+    const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
+    log(timedOut ? `upstream quá ${UPSTREAM_TIMEOUT_MS}ms không trả lời` : `upstream lỗi mạng: ${e}`);
+    return anthropicError(
+      res,
+      timedOut ? 504 : 502,
+      "api_error",
+      timedOut ? `upstream không trả lời trong ${UPSTREAM_TIMEOUT_MS}ms` : `không gọi được upstream: ${e}`,
+    );
   }
 
   if (!upstream.ok) {
