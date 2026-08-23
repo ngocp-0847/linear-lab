@@ -9,15 +9,16 @@
  *   2. Knowledge :8421  wiki/raw/write     → tải file nguồn lên
  *   3. Knowledge :8421  wiki/ingest        → LLM chưng cất thành page
  *   4. Knowledge :8421  wiki/get           → chờ tới khi ready
- *   5. Core      :8420  knowledge/create   → đăng ký vào metadata
- *   6. Core      :8420  agent-fixed-asset/set → gán cho từng agent
+ *   5. Knowledge :8421  code-graph/create + sync → index repo public
+ *   6. Core      :8420  knowledge/create   → đăng ký cả hai vào metadata
+ *   7. Core      :8420  agent-fixed-asset/set → gán theo vai trò
  *
  * Bước 5 là mắt xích hay bị quên: Knowledge service tự nó KHÔNG cho proxy biết
  * wiki tồn tại. Proxy đọc binding từ metadata của Core rồi mới tra chi tiết.
  * Thiếu bước này thì injector log `listAgentKnowledgeIds → 0 ids` và im lặng
  * không nhồi gì cả.
  *
- * Bước 6 dùng `set`, KHÔNG phải `add`: nó thay toàn bộ binding của agent. Nên
+ * Bước 7 dùng `set`, KHÔNG phải `add`: nó thay toàn bộ binding của agent. Nên
  * mỗi lần gọi phải liệt kê đủ mọi asset agent đó cần.
  */
 
@@ -131,9 +132,58 @@ while (Date.now() < deadline) {
 if (detail?.status !== "ready") throw new Error("hết giờ chờ ingest");
 info(`xong: ${detail.page_count ?? "?"} page`);
 
-// ── 5. Đăng ký vào metadata của Core ────────────────────────────────────────
+// ── 5. CodeGraph ────────────────────────────────────────────────────────────
+// Fetcher CHỈ nhận public HTTPS — `src/source-fetcher/git-fetcher.ts` chặn cứng
+// mọi thứ khác, kể cả `file://` và địa chỉ nội bộ. Nên repo phải công khai.
 
-step(5, "Đăng ký knowledge vào MemoryCore");
+const REPO_URL = process.env.REPO_URL ?? ids.repo_url;
+let cgId = null;
+
+if (!REPO_URL) {
+  step(5, "Bỏ qua CodeGraph — chưa có repo_url");
+  info("đặt REPO_URL hoặc thêm repo_url vào .lab-ids");
+} else {
+  step(5, `Tạo CodeGraph từ ${REPO_URL}`);
+  const cg = await post(KNOWLEDGE, "/code-graph/create", {
+    team_id: TEAM,
+    user_id: OWNER,
+    repo_url: REPO_URL,
+    branch: process.env.REPO_BRANCH ?? "main",
+    repo_name: "linear-lab",
+  });
+  cgId = cg.code_graph_id ?? cg.id;
+  info(`code_graph_id = ${cgId}`);
+
+  await post(KNOWLEDGE, "/code-graph/sync", { team_id: TEAM, code_graph_id: cgId, user_id: OWNER })
+    .then(() => info("đã gửi sync"))
+    .catch((e) => info(`sync có thể đã tự chạy lúc create: ${e.message}`));
+
+  const cgDeadline = Date.now() + 10 * 60_000;
+  let cgStatus = "";
+  while (Date.now() < cgDeadline) {
+    const d = await post(KNOWLEDGE, "/code-graph/get", { team_id: TEAM, code_graph_id: cgId });
+    const st = d.status ?? "unknown";
+    if (st !== cgStatus) {
+      info(`status = ${st}`);
+      cgStatus = st;
+    }
+    if (st === "ready") break;
+    if (st === "failed") {
+      info(`index thất bại: ${d.error ?? "không rõ"} — vẫn đăng ký wiki, bỏ code-graph`);
+      cgId = null;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  if (cgId && cgStatus !== "ready") {
+    info("hết giờ chờ index — bỏ code-graph khỏi phần gán");
+    cgId = null;
+  }
+}
+
+// ── 6. Đăng ký vào metadata của Core ────────────────────────────────────────
+
+step(6, "Đăng ký knowledge vào MemoryCore");
 await post(
   CORE,
   "/v3/knowledge/create",
@@ -148,30 +198,62 @@ await post(
   },
   { "x-tdai-user-key": USER_KEY },
 );
-info("đã đăng ký — giờ proxy mới nhìn thấy được");
+info("wiki đã đăng ký — giờ proxy mới nhìn thấy được");
 
-// ── 6. Gán cho agent ────────────────────────────────────────────────────────
+if (cgId) {
+  await post(
+    CORE,
+    "/v3/knowledge/create",
+    {
+      knowledge_id: cgId,
+      type: "code-graph",
+      service_url: KNOWLEDGE,
+      name: "linear-lab — đồ thị mã nguồn",
+      summary: "Ký hiệu, file, quan hệ gọi và phạm vi ảnh hưởng của repo linear-lab",
+      team_id: TEAM,
+      user_id: OWNER,
+      repo_url: REPO_URL,
+      branch: process.env.REPO_BRANCH ?? "main",
+    },
+    { "x-tdai-user-key": USER_KEY },
+  );
+  info("code-graph đã đăng ký");
+}
 
-step(6, "Gán wiki cho từng agent");
+// ── 7. Gán asset theo vai trò ───────────────────────────────────────────────
+// Mỗi vai trò một loadout riêng — đây chính là điểm của Memory Hub: không phải
+// ai cũng nhận mọi thứ. Hiện cả ba cùng cần spec + đồ thị mã; khi có Skill
+// riêng cho từng vai trò thì bảng này mới thực sự phân hoá.
+
+const wikiBinding = {
+  asset_id: wikiId, asset_type: "llm_wiki", injection_mode: "tool", priority: 10, created_by: OWNER,
+};
+const cgBinding = cgId
+  ? { asset_id: cgId, asset_type: "code_graph", injection_mode: "tool", priority: 20, created_by: OWNER }
+  : null;
+
+const LOADOUT = {
+  Architect: [wikiBinding, cgBinding], // spec + đồ thị để quyết ranh giới module
+  Builder: [wikiBinding, cgBinding],   // spec để biết làm gì, đồ thị để biết sửa đâu
+  Reviewer: [wikiBinding, cgBinding],  // đồ thị để soi ảnh hưởng, spec để đối chiếu ràng buộc
+};
+
+step(7, "Gán asset cho từng agent");
 for (const [name, agentId] of Object.entries(AGENTS)) {
   if (!agentId) {
     info(`bỏ qua ${name}: thiếu agent_id`);
     continue;
   }
+  const bindings = (LOADOUT[name] ?? []).filter(Boolean);
   // `set` THAY THẾ toàn bộ binding của agent, không phải thêm vào.
   await post(
     CORE,
     "/v3/meta/agent-fixed-asset/set",
-    {
-      agent_id: agentId,
-      bindings: [
-        { asset_id: wikiId, asset_type: "llm_wiki", injection_mode: "tool", priority: 10, created_by: OWNER },
-      ],
-    },
+    { agent_id: agentId, bindings },
     { "x-tdai-user-key": USER_KEY },
   );
-  info(`${name} (${agentId}) ← wiki`);
+  info(`${name} ← ${bindings.map((b) => b.asset_type).join(" + ") || "(rỗng)"}`);
 }
 
-console.log(`\nXong. wiki_id = ${wikiId}`);
+console.log(`\nXong. wiki=${wikiId}  code_graph=${cgId ?? "(bỏ qua)"}`);
 console.log("Kiểm chứng: npm run check:stack, rồi hỏi agent một câu về nội dung spec.");

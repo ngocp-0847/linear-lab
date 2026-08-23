@@ -8,6 +8,7 @@ Bốn dịch vụ, tất cả chạy trong WSL (Ubuntu 24.04). Windows gọi và
 | MemoryProxy | 8096 | `wsl -- bash -lc 'bash ~/start-proxy.sh'` | **v22 bắt buộc** |
 | Anthropic shim | 8097 | `wsl -- bash -lc 'bash ~/start-shim.sh'` | v24 |
 | Memory Hub | 8123 | `wsl -- bash -lc 'cd ~/workspace/tdam/MemoryPanel && npx tsx src/index.ts'` | v24 |
+| MemoryKnowledge | 8421 | `wsl -- bash -lc 'bash ~/knowledge-node22.sh'` | **v22 bắt buộc** |
 
 IP WSL đổi mỗi lần khởi động lại: `wsl -- hostname -I`.
 
@@ -30,7 +31,7 @@ lại kiểu đặt khoá này cho thứ gì chạm mạng thật.
 
 ---
 
-## Sáu thứ phải biết, không có trong tài liệu
+## Bảy thứ phải biết, không có trong tài liệu
 
 Tất cả đều tìm ra bằng cách chạy thật rồi đọc log, không suy ra được từ docs.
 
@@ -97,6 +98,25 @@ curl -X POST http://<wsl-ip>:8420/v3/internal/meta/user/init-admin \
 ### 6. Task là bắt buộc, không phải tuỳ chọn
 
 Header auto-select cần **đủ cả ba** id. Thiếu `x-task-id` là rơi về form tương tác — mà chạy headless thì không ai trả lời form được, kết quả là session bypass, mất sạch memory. Nên mỗi việc giao cho agent phải có một Task trong Hub trước.
+
+### 7. MemoryKnowledge cũng phải chạy Node 22
+
+Khác lý do với proxy. `better-sqlite3@11.10` **không có prebuild cho Node 24**,
+nên npm rơi vào biên dịch bằng node-gyp — mà máy không có build toolchain.
+
+Chỗ độc là **npm vẫn báo `exit 0`**: lần cài đầu ra 261 package, nhìn như thành
+công, nhưng `node_modules/.bin/` không tồn tại và service không khởi động được
+với `tsx: not found`. Lỗi thật (`gyp ERR! not ok`) nằm sâu trong output.
+
+Chạy bằng Node 22 thì npm tải prebuild, không biên dịch gì cả. Dùng
+`~/knowledge-node22.sh` (tự `nvm use 22`), và script có bước tự kiểm:
+
+```bash
+node -e "require('better-sqlite3')"
+```
+
+Đừng tin `exit 0` của npm khi có native module — kiểm tra `node_modules/.bin/`
+tồn tại và nạp thử module.
 
 ---
 
