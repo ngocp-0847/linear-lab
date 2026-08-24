@@ -31,7 +31,7 @@ lại kiểu đặt khoá này cho thứ gì chạm mạng thật.
 
 ---
 
-## Tám thứ phải biết, không có trong tài liệu
+## Chín thứ phải biết, không có trong tài liệu
 
 Tất cả đều tìm ra bằng cách chạy thật rồi đọc log, không suy ra được từ docs.
 
@@ -144,6 +144,30 @@ Ba điểm dễ vấp:
 
 Toàn bộ chuỗi nằm trong [tools/seed-knowledge.mjs](../tools/seed-knowledge.mjs),
 chạy lại được nhiều lần (bỏ qua ingest nếu wiki đã `ready`).
+
+### 9. Đừng ghi cấu hình lab vào config toàn cục của CLI
+
+Tôi đã mắc lỗi này: viết `model_provider = "lab-proxy"` vào
+`~/.codex/config.toml`. Hệ quả là **mọi phiên Codex của người dùng** — kể cả
+việc chẳng liên quan gì tới lab — đều đi qua proxy này, dùng model của lab và
+bị inject bộ nhớ của lab. Triệu chứng nhìn thấy: tên "Linear Lab proxy" hiện
+lên trong UI như provider đang hoạt động.
+
+Cách đúng: truyền toàn bộ cấu hình provider qua `-c` ở từng lần gọi
+([tools/run-agent.sh](../tools/run-agent.sh)). Config toàn cục giữ nguyên.
+
+Kiểm tra tách bạch bằng hai câu hỏi:
+
+```bash
+# qua runner → phải biết mình là agent nào
+echo "ban duoc gan vao agent nao?" | bash tools/run-agent.sh Builder -
+
+# codex thường → phải KHÔNG biết gì về lab
+codex exec --skip-git-repo-check -s read-only < /dev/null "ban co agent memory nao khong?"
+```
+
+Cùng lỗi này áp cho Claude Code: dùng biến môi trường trong phạm vi script,
+đừng viết vào `settings.json`.
 
 ### Giới hạn đã gặp: CodeGraph cần mạng ổn định
 

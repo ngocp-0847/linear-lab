@@ -62,18 +62,26 @@ x-conversation-id: $CONV"
     ;;
 
   Builder)
-    # Codex lấy session từ header `session-id` hoặc body.client_metadata.session_id
-    # (nó tự gửi cái sau), nên chỉ cần ba header định danh.
-    # `< /dev/null`: codex nối stdin vào prompt khi thấy stdin là pipe. Script
-    # này đã đọc prompt từ file/stdin rồi truyền qua tham số, nên phải đóng
-    # stdin — không thì codex treo ở "Reading additional input from stdin".
-    # Công cụ bộ nhớ của proxy được mô tả dưới dạng "Bash + curl". Sandbox mặc
-    # định của codex chặn mọi lệnh mạng, nên agent thấy mô tả mà gọi không được
-    # — rồi lặng lẽ chuyển sang `git grep`. Phải mở `network_access`.
-    codex exec --skip-git-repo-check -s workspace-write \
-      -c "sandbox_workspace_write.network_access=true" < /dev/null \
-      -c "model_provider=\"lab-proxy\"" \
+    # ── Ba điều đã phải trả giá để biết ──
+    #
+    # a. MỌI cấu hình provider truyền qua `-c`, KHÔNG ghi vào ~/.codex/config.toml.
+    #    Đặt `model_provider` ở config toàn cục sẽ khiến MỌI phiên codex của
+    #    người dùng đi qua proxy này — kể cả việc chẳng liên quan gì tới lab.
+    #
+    # b. `< /dev/null`: codex nối stdin vào prompt khi thấy stdin là pipe. Script
+    #    đã đọc prompt rồi truyền qua tham số, nên phải đóng stdin — không thì
+    #    nó treo ở "Reading additional input from stdin".
+    #
+    # c. `network_access=true`: công cụ bộ nhớ của proxy được mô tả dạng
+    #    "Bash + curl". Sandbox mặc định chặn lệnh mạng, agent thấy mô tả mà
+    #    gọi không được rồi lặng lẽ chuyển sang `git grep`.
+    #    (Vẫn chưa đủ — xem docs/adr/0002: policy duyệt lệnh chặn trước.)
+    #
+    # Codex tự gửi session qua body.client_metadata.session_id nên chỉ cần ba
+    # header định danh.
+    codex exec --skip-git-repo-check -s workspace-write       -c "sandbox_workspace_write.network_access=true" < /dev/null       -c "model_provider=\"lab-proxy\"" \
       -c "model=\"$MODEL\"" \
+      -c "disable_response_storage=true" \
       -c "model_providers.lab-proxy.name=\"Linear Lab proxy\"" \
       -c "model_providers.lab-proxy.wire_api=\"responses\"" \
       -c "model_providers.lab-proxy.base_url=\"$PROXY/codex/default\"" \
